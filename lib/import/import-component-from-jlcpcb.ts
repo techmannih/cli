@@ -2,6 +2,7 @@ import {
   fetchEasyEDAComponent,
   convertRawEasyEdaToTs as convertRawEasyToTsx,
   convertEasyEdaJsonToCircuitJson,
+  normalizeManufacturerPartNumber,
 } from "easyeda"
 import fs from "node:fs/promises"
 import path from "node:path"
@@ -27,11 +28,7 @@ export const importComponentFromJlcpcb = async (
   const component = await fetchEasyEDAComponent(jlcpcbPartNumber)
   let tsxContent = await convertRawEasyToTsx(component)
 
-  const componentNameMatch = tsxContent.match(/export const (\w+) = .*/)
-  const fileName = componentNameMatch?.[1]
-  if (!fileName) {
-    throw new Error("Could not determine file name of converted component")
-  }
+  const fileName = getImportedComponentName(component, jlcpcbPartNumber)
 
   const importsDir = path.join(projectDir, "imports")
   const componentDir = path.join(importsDir, fileName)
@@ -55,6 +52,18 @@ export const importComponentFromJlcpcb = async (
   return { filePath, modelFilePaths }
 }
 
+type FetchedEasyEdaComponent = Awaited<ReturnType<typeof fetchEasyEDAComponent>>
+
+const getImportedComponentName = (
+  component: FetchedEasyEdaComponent,
+  jlcpcbPartNumber: string,
+) => {
+  const manufacturerPartNumber =
+    component.dataStr.head.c_para["Manufacturer Part"] ?? jlcpcbPartNumber
+
+  return normalizeManufacturerPartNumber(manufacturerPartNumber)
+}
+
 /**
  * Downloads the 3D models referenced in the component and updates the TSX to use local paths.
  */
@@ -62,7 +71,7 @@ async function downloadAndLocalize3dModel(params: {
   tsxContent: string
   jlcpcbPartNumber: string
   componentDir: string
-  component: any
+  component: FetchedEasyEdaComponent
 }): Promise<{ tsxContent: string; modelFilePaths: string[] }> {
   let { tsxContent } = params
   const { jlcpcbPartNumber, componentDir, component } = params
@@ -71,22 +80,26 @@ async function downloadAndLocalize3dModel(params: {
   const platformConfig = getCompletePlatformConfig()
   const platformFetch = platformConfig.platformFetch ?? globalThis.fetch
 
-  // Extract remote URLs from the circuit JSON (more robust than regex on TSX)
-  const circuitJson = convertEasyEdaJsonToCircuitJson(component, {
-    useModelCdn: true,
-    shouldRecenter: true,
-  })
-  const remoteUrls: string[] = circuitJson
-    .filter((item: any) => item.type === "cad_component" && item.model_obj_url)
-    .map((item: any) => item.model_obj_url)
-
-  // Fallback: if no model URLs found in circuitJson, try to extract from TSX
-  if (remoteUrls.length === 0) {
-    const objUrlMatch = tsxContent.match(/objUrl:\s*"([^"]+)"/)
-    if (objUrlMatch?.[1]) {
-      remoteUrls.push(objUrlMatch[1])
-    }
-  }
+  const circuitJson = convertEasyEdaJsonToCircuitJson(
+    component as unknown as Parameters<
+      typeof convertEasyEdaJsonToCircuitJson
+    >[0],
+    {
+      useModelCdn: true,
+      shouldRecenter: true,
+    },
+  )
+  const remoteUrls = Array.from(
+    new Set(
+      circuitJson
+        .flatMap((item: any) =>
+          item.type === "cad_component" && item.model_obj_url
+            ? [item.model_obj_url]
+            : [],
+        )
+        .filter((url): url is string => typeof url === "string"),
+    ),
+  )
 
   for (const remoteUrl of remoteUrls) {
     try {
@@ -97,17 +110,12 @@ async function downloadAndLocalize3dModel(params: {
       }
 
       const modelFileName = `${jlcpcbPartNumber}.obj`
-
       const modelFilePath = path.join(componentDir, modelFileName)
       const arrayBuffer = await response.arrayBuffer()
       await fs.writeFile(modelFilePath, Buffer.from(arrayBuffer))
       modelFilePaths.push(modelFilePath)
 
-      // Update TSX to use relative path (safer because we know the exact remote URL)
       const localModelPath = `./${modelFileName}`
-
-      // We replace the remote URL wherever it appears in the TSX content
-      // This works because the URL is unique and identifies the objUrl/modelUrl prop
       tsxContent = tsxContent
         .split(`"${remoteUrl}"`)
         .join(`"${localModelPath}"`)
